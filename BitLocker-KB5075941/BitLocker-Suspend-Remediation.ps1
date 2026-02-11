@@ -17,19 +17,36 @@
 #
 # ============================================
 
+# Output buffer for Intune Remediation reporting
+# (Intune only shows last Write-Output, so we collect all and output once at the end)
+$script:logBuffer = @()
+
+# Helper function to add log messages
+function Write-Log {
+    param([string]$Message)
+    $script:logBuffer += $Message
+}
+
+# Helper function to exit with full log output
+function Exit-WithLog {
+    param([int]$ExitCode = 0)
+    Write-Output ($script:logBuffer -join "`n")
+    exit $ExitCode
+}
+
 # ============================================
 # MAIN
 # ============================================
 
 try {
-    Write-Output "Suspending BitLocker for 1 reboot..."
+    Write-Log "Suspending BitLocker for 1 reboot..."
 
     # Check BitLocker status
     $blv = Get-BitLockerVolume -MountPoint "C:" -ErrorAction Stop
 
     if ($blv.ProtectionStatus -ne "On") {
-        Write-Output "INFO: BitLocker protection is not ON - nothing to suspend"
-        exit 0
+        Write-Log "INFO: BitLocker protection is not ON - nothing to suspend"
+        Exit-WithLog 0
     }
 
     # Suspend BitLocker for 1 reboot
@@ -39,28 +56,28 @@ try {
     $blvAfter = Get-BitLockerVolume -MountPoint "C:" -ErrorAction Stop
 
     if ($blvAfter.ProtectionStatus -eq "Off") {
-        Write-Output ""
-        Write-Output "=========================================="
-        Write-Output "SUCCESS: BitLocker suspended for 1 reboot"
-        Write-Output "=========================================="
-        Write-Output "BitLocker protection is now SUSPENDED"
-        Write-Output "Next reboot will:"
-        Write-Output "  1. Allow boot manager update (KB5075941)"
-        Write-Output "  2. NOT trigger BitLocker recovery prompt"
-        Write-Output "  3. Automatically RESUME BitLocker protection"
-        Write-Output ""
-        Write-Output "Protection Status: $($blvAfter.ProtectionStatus)"
-        Write-Output "Encryption Percentage: $($blvAfter.EncryptionPercentage)%"
-        Write-Output "Volume Status: $($blvAfter.VolumeStatus)"
-        Write-Output "=========================================="
-        exit 0
+        Write-Log ""
+        Write-Log "=========================================="
+        Write-Log "SUCCESS: BitLocker suspended for 1 reboot"
+        Write-Log "=========================================="
+        Write-Log "BitLocker protection is now SUSPENDED"
+        Write-Log "Next reboot will:"
+        Write-Log "  1. Allow boot manager update (KB5075941)"
+        Write-Log "  2. NOT trigger BitLocker recovery prompt"
+        Write-Log "  3. Automatically RESUME BitLocker protection"
+        Write-Log ""
+        Write-Log "Protection Status: $($blvAfter.ProtectionStatus)"
+        Write-Log "Encryption Percentage: $($blvAfter.EncryptionPercentage)%"
+        Write-Log "Volume Status: $($blvAfter.VolumeStatus)"
+        Write-Log "=========================================="
+        Exit-WithLog 0
     }
     else {
-        Write-Output "ERROR: BitLocker suspension failed - protection status still: $($blvAfter.ProtectionStatus)"
-        exit 1
+        Write-Log "ERROR: BitLocker suspension failed - protection status still: $($blvAfter.ProtectionStatus)"
+        Exit-WithLog 1
     }
 }
 catch {
-    Write-Output "ERROR: Failed to suspend BitLocker: $($_.Exception.Message)"
-    exit 1
+    Write-Log "ERROR: Failed to suspend BitLocker: $($_.Exception.Message)"
+    Exit-WithLog 1
 }

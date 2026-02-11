@@ -45,6 +45,23 @@ $UseInventoryData = $true
 
 $CredentialsRegistryPath = "HKLM:\SOFTWARE\Company\GraphAPI"
 
+# Output buffer for Intune Remediation reporting
+# (Intune only shows last Write-Output, so we collect all and output once at the end)
+$script:logBuffer = @()
+
+# Helper function to add log messages
+function Write-Log {
+    param([string]$Message)
+    $script:logBuffer += $Message
+}
+
+# Helper function to exit with full log output
+function Exit-WithLog {
+    param([int]$ExitCode = 0)
+    Write-Output ($script:logBuffer -join "`n")
+    exit $ExitCode
+}
+
 Add-Type -AssemblyName System.Security
 
 function Unprotect-DPAPIString {
@@ -112,11 +129,66 @@ function Get-GraphToken {
 function Get-EntraDeviceId {
     try {
         $dsregOutput = dsregcmd /status 2>&1
+
+        # IMPORTANT: For Hybrid-joined devices, there are TWO Device IDs:
+        # - DeviceId (On-Prem AD) - does NOT work with Graph API
+        # - AzureAdDeviceId (Entra ID) - this is what we need!
+        # So we MUST prioritize AzureAdDeviceId over DeviceId
+
+        $azureAdDeviceId = $null
+        $fallbackDeviceId = $null
+
         foreach ($line in $dsregOutput) {
-            if ($line -match "DeviceId\s*:\s*(.+)") {
-                return $Matches[1].Trim()
+            # PRIORITY 1: AzureAdDeviceId (works for both Entra-joined and Hybrid-joined)
+            # This field name should be consistent across all languages
+            if ($line -match "AzureAdDeviceId\s*:\s*(.+)") {
+                $id = $Matches[1].Trim()
+                if ($id -match '^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$') {
+                    $azureAdDeviceId = $id
+                }
+            }
+
+            # PRIORITY 2: DeviceId (fallback for pure Entra-joined)
+            # This field name should be consistent across all languages
+            if ($line -match "^DeviceId\s*:\s*(.+)" -or $line -match "^\s+DeviceId\s*:\s*(.+)") {
+                $id = $Matches[1].Trim()
+                if ($id -match '^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$') {
+                    if (-not $fallbackDeviceId) {
+                        $fallbackDeviceId = $id
+                    }
+                }
             }
         }
+
+        # PRIORITY 3: Language-independent fallback
+        # Search for any line with pattern: <something-ID> : <GUID>
+        # This catches localized field names like "Geraete-ID" (German), "ID de dispositivo" (Spanish), etc.
+        if (-not $azureAdDeviceId -and -not $fallbackDeviceId) {
+            foreach ($line in $dsregOutput) {
+                # Match pattern: <word containing "id" or "ID"> : <GUID>
+                if ($line -match "(?i)\S*id\S*\s*:\s*([0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12})") {
+                    $id = $Matches[1].Trim()
+                    # Validate GUID format
+                    if ($id -match '^[{]?[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}[}]?$') {
+                        # Skip known non-device IDs (like CorrelationId, TenantId, etc.)
+                        if ($line -notmatch "(?i)(CorrelationId|TenantId|ThumbPrint|Certificate)") {
+                            if (-not $fallbackDeviceId) {
+                                $fallbackDeviceId = $id
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        # Return in order of priority
+        if ($azureAdDeviceId) {
+            return $azureAdDeviceId
+        }
+        elseif ($fallbackDeviceId) {
+            return $fallbackDeviceId
+        }
+
         return $null
     }
     catch {
@@ -149,15 +221,15 @@ function Get-DeviceExtensionAttribute {
 # ============================================
 
 try {
-    Write-Output "Checking BitLocker KB5075941 risk status..."
-    Write-Output ""
+    Write-Log "Checking BitLocker KB5075941 risk status..."
+    Write-Log ""
 
     # ========================================
     # PRIMARY DETECTION: Extension Attribute
     # ========================================
 
     if ($UseInventoryData) {
-        Write-Output "Method 1: Checking Extension Attribute (Inventory-based)..."
+        Write-Log "Method 1: Checking Extension Attribute (Inventory-based)..."
 
         # Check credentials
         $creds = Get-GraphCredentials
@@ -172,57 +244,57 @@ try {
                     $extAttr = Get-DeviceExtensionAttribute -Token $token -DeviceId $entraDeviceId -AttributeNumber $ExtensionAttributeNumber
 
                     if ($extAttr) {
-                        Write-Output "  Extension Attribute value: $extAttr"
+                        Write-Log "  Extension Attribute value: $extAttr"
 
                         # Check for RISK tag
                         if ($extAttr -like "*RISK*") {
-                            Write-Output ""
-                            Write-Output "=========================================="
-                            Write-Output "RISK DETECTED (Inventory-based)!"
-                            Write-Output "=========================================="
-                            Write-Output "Device is tagged as AT RISK in central inventory:"
-                            Write-Output ""
-                            Write-Output "  Status: $extAttr"
-                            Write-Output ""
-                            Write-Output "This means:"
-                            Write-Output "  - Device has old boot manager (validated via PCR4 fingerprint)"
-                            Write-Output "  - BitLocker + Secure Boot + TPM enabled"
-                            Write-Output "  - KB5075941 not yet installed"
-                            Write-Output ""
-                            Write-Output "Remediation needed: Suspend BitLocker for 1 reboot"
-                            Write-Output "=========================================="
-                            exit 1
+                            Write-Log ""
+                            Write-Log "=========================================="
+                            Write-Log "RISK DETECTED (Inventory-based)!"
+                            Write-Log "=========================================="
+                            Write-Log "Device is tagged as AT RISK in central inventory:"
+                            Write-Log ""
+                            Write-Log "  Status: $extAttr"
+                            Write-Log ""
+                            Write-Log "This means:"
+                            Write-Log "  - Device has old boot manager (validated via PCR4 fingerprint)"
+                            Write-Log "  - BitLocker + Secure Boot + TPM enabled"
+                            Write-Log "  - KB5075941 not yet installed"
+                            Write-Log ""
+                            Write-Log "Remediation needed: Suspend BitLocker for 1 reboot"
+                            Write-Log "=========================================="
+                            Exit-WithLog 1
                         }
                         else {
-                            Write-Output "  [OK] No RISK tag found in inventory"
-                            Write-Output ""
-                            Write-Output "COMPLIANT: Device is not at risk according to inventory"
-                            Write-Output "(either KB installed, or new boot manager detected via PCR4)"
-                            exit 0
+                            Write-Log "  [OK] No RISK tag found in inventory"
+                            Write-Log ""
+                            Write-Log "COMPLIANT: Device is not at risk according to inventory"
+                            Write-Log "(either KB installed, or new boot manager detected via PCR4)"
+                            Exit-WithLog 0
                         }
                     }
                     else {
-                        Write-Output "  [WARN] Extension Attribute is empty - device not yet inventoried"
-                        Write-Output "  Falling back to local detection..."
-                        Write-Output ""
+                        Write-Log "  [WARN] Extension Attribute is empty - device not yet inventoried"
+                        Write-Log "  Falling back to local detection..."
+                        Write-Log ""
                     }
                 }
                 else {
-                    Write-Output "  [WARN] Graph authentication failed"
-                    Write-Output "  Falling back to local detection..."
-                    Write-Output ""
+                    Write-Log "  [WARN] Graph authentication failed"
+                    Write-Log "  Falling back to local detection..."
+                    Write-Log ""
                 }
             }
             else {
-                Write-Output "  [WARN] Could not get Entra Device ID"
-                Write-Output "  Falling back to local detection..."
-                Write-Output ""
+                Write-Log "  [WARN] Could not get Entra Device ID"
+                Write-Log "  Falling back to local detection..."
+                Write-Log ""
             }
         }
         else {
-            Write-Output "  [WARN] No Graph credentials found"
-            Write-Output "  Falling back to local detection..."
-            Write-Output ""
+            Write-Log "  [WARN] No Graph credentials found"
+            Write-Log "  Falling back to local detection..."
+            Write-Log ""
         }
     }
 
@@ -230,8 +302,8 @@ try {
     # FALLBACK DETECTION: Local Checks
     # ========================================
 
-    Write-Output "Method 2: Local security checks (fallback)..."
-    Write-Output ""
+    Write-Log "Method 2: Local security checks (fallback)..."
+    Write-Log ""
 
     # Check 1: BitLocker protection enabled on C:?
     $bitlockerEnabled = $false
@@ -239,16 +311,16 @@ try {
         $blv = Get-BitLockerVolume -MountPoint "C:" -ErrorAction SilentlyContinue
         if ($blv -and $blv.ProtectionStatus -eq "On") {
             $bitlockerEnabled = $true
-            Write-Output "  [OK] BitLocker protection is ON"
+            Write-Log "  [OK] BitLocker protection is ON"
         }
         else {
-            Write-Output "  [SKIP] BitLocker protection is OFF - no risk"
-            exit 0
+            Write-Log "  [SKIP] BitLocker protection is OFF - no risk"
+            Exit-WithLog 0
         }
     }
     catch {
-        Write-Output "  [SKIP] BitLocker not available - no risk"
-        exit 0
+        Write-Log "  [SKIP] BitLocker not available - no risk"
+        Exit-WithLog 0
     }
 
     # Check 2: Secure Boot enabled?
@@ -257,16 +329,16 @@ try {
         $secureBoot = Confirm-SecureBootUEFI -ErrorAction SilentlyContinue
         if ($secureBoot -eq $true) {
             $secureBootEnabled = $true
-            Write-Output "  [OK] Secure Boot is ENABLED"
+            Write-Log "  [OK] Secure Boot is ENABLED"
         }
         else {
-            Write-Output "  [SKIP] Secure Boot is DISABLED - no risk"
-            exit 0
+            Write-Log "  [SKIP] Secure Boot is DISABLED - no risk"
+            Exit-WithLog 0
         }
     }
     catch {
-        Write-Output "  [SKIP] Secure Boot not available (legacy BIOS) - no risk"
-        exit 0
+        Write-Log "  [SKIP] Secure Boot not available (legacy BIOS) - no risk"
+        Exit-WithLog 0
     }
 
     # Check 3: TPM owned?
@@ -275,16 +347,16 @@ try {
         $tpm = Get-Tpm -ErrorAction SilentlyContinue
         if ($tpm -and $tpm.TpmOwned -eq $true) {
             $tpmOwned = $true
-            Write-Output "  [OK] TPM is owned and ready"
+            Write-Log "  [OK] TPM is owned and ready"
         }
         else {
-            Write-Output "  [SKIP] TPM not owned - no risk"
-            exit 0
+            Write-Log "  [SKIP] TPM not owned - no risk"
+            Exit-WithLog 0
         }
     }
     catch {
-        Write-Output "  [SKIP] TPM not available - no risk"
-        exit 0
+        Write-Log "  [SKIP] TPM not available - no risk"
+        Exit-WithLog 0
     }
 
     # Check 4: KB5075941 already installed?
@@ -293,44 +365,44 @@ try {
         $kb = Get-HotFix -Id "KB5075941" -ErrorAction SilentlyContinue
         if ($kb) {
             $kbInstalled = $true
-            Write-Output "  [OK] KB5075941 already installed - no risk"
-            exit 0
+            Write-Log "  [OK] KB5075941 already installed - no risk"
+            Exit-WithLog 0
         }
         else {
-            Write-Output "  [WARN] KB5075941 NOT installed yet"
+            Write-Log "  [WARN] KB5075941 NOT installed yet"
         }
     }
     catch {
-        Write-Output "  [WARN] KB5075941 NOT installed yet"
+        Write-Log "  [WARN] KB5075941 NOT installed yet"
     }
 
     # Risk Assessment (Fallback)
     if ($bitlockerEnabled -and $secureBootEnabled -and $tpmOwned -and -not $kbInstalled) {
-        Write-Output ""
-        Write-Output "=========================================="
-        Write-Output "RISK DETECTED (Local checks - fallback)!"
-        Write-Output "=========================================="
-        Write-Output "This device meets all criteria for BitLocker recovery prompt"
-        Write-Output "when KB5075941 is installed:"
-        Write-Output "  - BitLocker: ON"
-        Write-Output "  - Secure Boot: ENABLED"
-        Write-Output "  - TPM: OWNED"
-        Write-Output "  - KB5075941: NOT INSTALLED"
-        Write-Output ""
-        Write-Output "NOTE: Using fallback detection (inventory data not available)"
-        Write-Output "      For more reliable detection, ensure Inventory remediation is running"
-        Write-Output ""
-        Write-Output "Remediation needed: Suspend BitLocker for 1 reboot"
-        Write-Output "=========================================="
-        exit 1
+        Write-Log ""
+        Write-Log "=========================================="
+        Write-Log "RISK DETECTED (Local checks - fallback)!"
+        Write-Log "=========================================="
+        Write-Log "This device meets all criteria for BitLocker recovery prompt"
+        Write-Log "when KB5075941 is installed:"
+        Write-Log "  - BitLocker: ON"
+        Write-Log "  - Secure Boot: ENABLED"
+        Write-Log "  - TPM: OWNED"
+        Write-Log "  - KB5075941: NOT INSTALLED"
+        Write-Log ""
+        Write-Log "NOTE: Using fallback detection (inventory data not available)"
+        Write-Log "      For more reliable detection, ensure Inventory remediation is running"
+        Write-Log ""
+        Write-Log "Remediation needed: Suspend BitLocker for 1 reboot"
+        Write-Log "=========================================="
+        Exit-WithLog 1
     }
 
     # No risk detected
-    Write-Output ""
-    Write-Output "COMPLIANT: No risk detected"
-    exit 0
+    Write-Log ""
+    Write-Log "COMPLIANT: No risk detected"
+    Exit-WithLog 0
 }
 catch {
-    Write-Output "ERROR: $($_.Exception.Message)"
-    exit 0
+    Write-Log "ERROR: $($_.Exception.Message)"
+    Exit-WithLog 0
 }
